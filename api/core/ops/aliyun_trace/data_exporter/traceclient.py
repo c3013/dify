@@ -10,8 +10,12 @@ from datetime import datetime
 from typing import Optional
 
 import requests
+from opentelemetry import metrics as metrics_api
 from opentelemetry import trace as trace_api
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.util.instrumentation import InstrumentationScope
@@ -37,6 +41,7 @@ class TraceClient:
         max_export_batch_size: int = 50,
     ):
         self.endpoint = endpoint
+        self.service_name = service_name
         self.resource = Resource(
             attributes={
                 ResourceAttributes.SERVICE_NAME: service_name,
@@ -60,6 +65,9 @@ class TraceClient:
         self.worker_thread.start()
 
         self._spans_dropped = False
+
+        # Initialize metrics client
+        self.metrics_client = MetricsClient(service_name=service_name, endpoint=endpoint)
 
     def export(self, spans: Sequence[ReadableSpan]):
         self.exporter.export(spans)
@@ -119,6 +127,8 @@ class TraceClient:
         self.worker_thread.join()
         self._export_batch()
         self.exporter.shutdown()
+        # Shutdown metrics client
+        self.metrics_client.shutdown()
 
 
 class SpanBuilder:
@@ -215,3 +225,166 @@ def convert_datetime_to_nanoseconds(start_time_a: Optional[datetime]) -> Optiona
     timestamp_in_seconds = start_time_a.timestamp()
     timestamp_in_nanoseconds = int(timestamp_in_seconds * 1e9)
     return timestamp_in_nanoseconds
+
+
+class MetricsClient:
+    """
+    Client for exporting OpenTelemetry metrics to Aliyun.
+    Handles histogram metrics for LLM operations.
+    """
+
+    def __init__(
+        self,
+        service_name: str,
+        endpoint: str,
+        export_interval_millis: int = 5000,
+    ):
+        """
+        Initialize the metrics client.
+
+        Args:
+            service_name: Name of the service (app_name)
+            endpoint: OTLP endpoint for metrics export
+            export_interval_millis: Interval for periodic metric export in milliseconds
+        """
+        self.service_name = service_name
+        self.endpoint = endpoint
+
+        # Create resource with service information
+        self.resource = Resource(
+            attributes={
+                ResourceAttributes.SERVICE_NAME: service_name,
+                ResourceAttributes.SERVICE_VERSION: f"dify-{dify_config.project.version}-{dify_config.COMMIT_SHA}",
+                ResourceAttributes.DEPLOYMENT_ENVIRONMENT: f"{dify_config.DEPLOY_ENV}-{dify_config.EDITION}",
+                ResourceAttributes.HOST_NAME: socket.gethostname(),
+            }
+        )
+
+        # Create OTLP metrics exporter
+        self.metric_exporter = OTLPMetricExporter(endpoint=endpoint)
+
+        # Create periodic metric reader
+        self.metric_reader = PeriodicExportingMetricReader(
+            exporter=self.metric_exporter,
+            export_interval_millis=export_interval_millis,
+        )
+
+        # Create meter provider
+        self.meter_provider = MeterProvider(
+            resource=self.resource,
+            metric_readers=[self.metric_reader],
+        )
+
+        # Get meter
+        self.meter = self.meter_provider.get_meter(__name__)
+
+        # Create histogram instruments for LLM metrics
+        self.time_to_first_token_histogram = self.meter.create_histogram(
+            name="gen_ai.client.time_to_first_token",
+            description="Time to first token in LLM responses",
+            unit="s",
+        )
+
+        self.time_per_output_token_histogram = self.meter.create_histogram(
+            name="gen_ai.client.time_per_output_token",
+            description="Average time per output token",
+            unit="s",
+        )
+
+        self.time_between_token_histogram = self.meter.create_histogram(
+            name="gen_ai.client.time_between_token",
+            description="Time between tokens in LLM responses",
+            unit="s",
+        )
+
+        self.operation_histogram = self.meter.create_histogram(
+            name="gen_ai.client.operation",
+            description="LLM operation count",
+            unit="1",
+        )
+
+        self.cached_tokens_histogram = self.meter.create_histogram(
+            name="gen_ai.usage.prompt_tokens_details.cached_tokens",
+            description="Number of cached tokens used",
+            unit="1",
+        )
+
+        self.operation_duration_histogram = self.meter.create_histogram(
+            name="gen_ai.client.operation.duration",
+            description="Duration of LLM operations",
+            unit="s",
+        )
+
+        self.token_usage_histogram = self.meter.create_histogram(
+            name="gen_ai.client.token.usage",
+            description="Token usage in LLM operations",
+            unit="1",
+        )
+
+    def record_llm_metrics(
+        self,
+        operation: str,
+        duration: float,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        cached_tokens: int = 0,
+        time_to_first_token: Optional[float] = None,
+        time_per_output_token: Optional[float] = None,
+        time_between_token: Optional[float] = None,
+    ) -> None:
+        """
+        Record LLM operation metrics.
+
+        Args:
+            operation: Operation type (e.g., "llm", "chat", "completion")
+            duration: Total operation duration in seconds
+            prompt_tokens: Number of prompt tokens
+            completion_tokens: Number of completion tokens
+            total_tokens: Total number of tokens
+            cached_tokens: Number of cached tokens (if available)
+            time_to_first_token: Time to first token in seconds (if available)
+            time_per_output_token: Average time per output token in seconds (if available)
+            time_between_token: Average time between tokens in seconds (if available)
+        """
+        # Common attributes for all metrics - include app_name tag
+        attributes = {
+            "app_name": self.service_name,
+            "operation": operation,
+        }
+
+        # Record operation histogram (value of 1 to count operations)
+        self.operation_histogram.record(1, attributes)
+
+        # Record operation duration
+        self.operation_duration_histogram.record(duration, attributes)
+
+        # Record token usage
+        self.token_usage_histogram.record(total_tokens, attributes)
+
+        # Record cached tokens if available
+        if cached_tokens > 0:
+            self.cached_tokens_histogram.record(cached_tokens, attributes)
+
+        # Record time to first token if available
+        if time_to_first_token is not None and time_to_first_token > 0:
+            self.time_to_first_token_histogram.record(time_to_first_token, attributes)
+
+        # Record or calculate time per output token
+        if time_per_output_token is not None and time_per_output_token > 0:
+            self.time_per_output_token_histogram.record(time_per_output_token, attributes)
+        elif completion_tokens > 0 and duration > 0:
+            # Calculate time per output token from duration and completion tokens
+            calculated_time_per_token = duration / completion_tokens
+            self.time_per_output_token_histogram.record(calculated_time_per_token, attributes)
+
+        # Record time between tokens if available
+        if time_between_token is not None and time_between_token > 0:
+            self.time_between_token_histogram.record(time_between_token, attributes)
+
+    def shutdown(self) -> None:
+        """Shutdown the metrics client and flush pending metrics."""
+        try:
+            self.meter_provider.shutdown()
+        except Exception as e:
+            logger.debug("Error shutting down metrics client: %s", e)

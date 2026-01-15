@@ -162,6 +162,22 @@ class AliyunDataTrace(BaseTraceInstance):
         app_model_config = getattr(trace_info.message_data, "app_model_config", {})
         pre_prompt = getattr(app_model_config, "pre_prompt", "")
         inputs_data = getattr(trace_info.message_data, "inputs", {})
+        
+        # Calculate duration for metrics
+        duration = 0.0
+        if trace_info.start_time and trace_info.end_time:
+            duration = (trace_info.end_time - trace_info.start_time).total_seconds()
+        
+        # Record LLM metrics
+        if trace_info.total_tokens > 0 and duration > 0:
+            self.trace_client.metrics_client.record_llm_metrics(
+                operation="message_llm",
+                duration=duration,
+                prompt_tokens=trace_info.message_tokens,
+                completion_tokens=trace_info.answer_tokens,
+                total_tokens=trace_info.total_tokens,
+            )
+        
         llm_span = SpanData(
             trace_id=trace_id,
             parent_span_id=message_span_id,
@@ -396,6 +412,23 @@ class AliyunDataTrace(BaseTraceInstance):
         process_data = node_execution.process_data or {}
         outputs = node_execution.outputs or {}
         usage_data = process_data.get("usage", {}) if "usage" in process_data else outputs.get("usage", {})
+        
+        # Extract metrics data
+        prompt_tokens = usage_data.get("prompt_tokens", 0)
+        completion_tokens = usage_data.get("completion_tokens", 0)
+        total_tokens = usage_data.get("total_tokens", 0)
+        latency = usage_data.get("latency", 0.0)
+        
+        # Record LLM metrics
+        if total_tokens > 0 and latency > 0:
+            self.trace_client.metrics_client.record_llm_metrics(
+                operation="llm",
+                duration=latency,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+        
         return SpanData(
             trace_id=trace_id,
             parent_span_id=workflow_span_id,
