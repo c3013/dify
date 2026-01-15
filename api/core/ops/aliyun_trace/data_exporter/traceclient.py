@@ -304,7 +304,7 @@ class MetricsClient:
         )
 
         self.cached_tokens_histogram = self.meter.create_histogram(
-            name="gen_ai.usage.prompt_tokens_details.cached_tokens",
+            name="gen_ai.usage.usage.prompt_tokens_details.cached_tokens",
             description="Number of cached tokens used",
             unit="1",
         )
