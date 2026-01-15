@@ -279,6 +279,8 @@ class MetricsClient:
         self.meter = self.meter_provider.get_meter(__name__)
 
         # Create histogram instruments for LLM metrics
+        # Note: Metric names follow the requirements specification exactly.
+        # They align with semantic conventions for generative AI metrics.
         self.time_to_first_token_histogram = self.meter.create_histogram(
             name="gen_ai.client.time_to_first_token",
             description="Time to first token in LLM responses",
@@ -375,6 +377,9 @@ class MetricsClient:
             self.time_per_output_token_histogram.record(time_per_output_token, attributes)
         elif completion_tokens > 0 and duration > 0:
             # Calculate time per output token from duration and completion tokens
+            # Note: This is an approximation as duration includes all processing time,
+            # not just token generation. More precise timing data would require
+            # streaming token timestamps.
             calculated_time_per_token = duration / completion_tokens
             self.time_per_output_token_histogram.record(calculated_time_per_token, attributes)
 
